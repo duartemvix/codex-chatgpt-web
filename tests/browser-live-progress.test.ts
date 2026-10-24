@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { chromium } from "playwright-core";
 import { chatGptResponseStructureLogEntries, chatGptResponseStructures } from "../src/adapters/chatgpt-web/browser-response-structure";
 import { chatGptInteractionState } from "../src/adapters/chatgpt-web/browser-interaction-state";
-import { ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptCompletionTracker, ChatGptSubmissionRejectionObserver, ChatGptTurnDomHealthTracker, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
+import { ChatGptBrowserObservationTimeoutError, ChatGptBrowserWorker, ChatGptCompletionTracker, ChatGptSubmissionRejectionObserver, ChatGptTurnDomHealthTracker, chatGptEffectiveCompletionActionVisible, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptAssistantTurnSelector, chatGptTurnContainerSelector } from "../src/chatgpt-ui/turns";
 import { ChatGptExternalTurnProgress } from "../src/adapters/chatgpt-web/turn-progress";
 
@@ -198,6 +198,30 @@ test("quiet response waiting remains bounded without delaying proven empty compl
   const vanished = new ChatGptTurnDomHealthTracker();
   expect(vanished.update({ ...quiet, responsePresent: false }, 0)).toBeUndefined();
   expect(vanished.update({ ...quiet, responsePresent: false }, 60_000)).toContain("did not create a response DOM");
+});
+
+test("raw one-shot completion is not stranded by a stale open conversation stream", () => {
+  expect(chatGptEffectiveCompletionActionVisible({
+    completionActionVisible: false,
+    allowCompletionWithoutAction: true,
+    running: false,
+    currentText: '[{"Company ID":"1","Fit Score":"Strong Fit"}]',
+    responseStreamActive: true,
+  })).toBeTrue();
+  expect(chatGptEffectiveCompletionActionVisible({
+    completionActionVisible: false,
+    allowCompletionWithoutAction: false,
+    running: false,
+    currentText: "normal Codex answer",
+    responseStreamActive: true,
+  })).toBeFalse();
+  expect(chatGptEffectiveCompletionActionVisible({
+    completionActionVisible: false,
+    allowCompletionWithoutAction: true,
+    running: true,
+    currentText: "still generating",
+    responseStreamActive: true,
+  })).toBeFalse();
 });
 
 test.each(["accepted", "late-accepted", "cancelled", "press-failed"])("a blocked Enter command is handled once: %s", async outcome => {

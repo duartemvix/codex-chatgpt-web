@@ -1,5 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { notifyLauncherTurn, readLauncherBrowserHostDescriptor } from "../../launcher-browser-host";
@@ -21,10 +23,22 @@ interface PendingTurn {
   localFailure?: Error;
   progressForwarding?: AbortController;
   acknowledgedMultipartStage?: number;
+  runAccepted?: boolean;
+  runAcceptanceTimer?: ReturnType<typeof setTimeout>;
+  preparedRunTempDir?: string;
+}
+
+const PREPARED_RUN_FILE_THRESHOLD_BYTES = 32 * 1024;
+
+interface PreparedRunFile {
+  path: string;
+  bytes: number;
+  sha256: string;
 }
 
 type HelperMessage =
   | { type: "ready"; features?: string[] }
+  | { type: "event"; id: string; event: "run_accepted" }
   | { type: "event"; id: string; event: "heartbeat" | "generation_progress" | "send_activated" | "submitted" | "reasoning" | "commentary" | "text"; text?: string; continuation?: boolean }
   | { type: "event"; id: string; event: "tool_batch_observed"; revision: number }
   | { type: "event"; id: string; event: "multipart_stage_acknowledged"; stageIndex: number }
@@ -114,6 +128,9 @@ function parseHelperMessage(line: string): HelperMessage {
       }
       return { type: "event", id: message.id, event, reused: message.reused };
     }
+    if (event === "run_accepted") {
+      return { type: "event", id: message.id, event };
+    }
     if (!["heartbeat", "generation_progress", "send_activated", "submitted", "reasoning", "commentary", "text"].includes(String(event))) {
       throw new Error("Launcher browser helper emitted an unknown event");
     }
@@ -187,7 +204,10 @@ export class LauncherBrowserHelperClient {
   private readonly pending = new Map<string, PendingTurn>();
   private helperFeatures = new Set<string>();
 
-  constructor(private readonly config: ResolvedBrowserConfig) {}
+  constructor(
+    private readonly config: ResolvedBrowserConfig,
+    private readonly runAcceptanceTimeoutMs = 5_000,
+  ) {}
 
   /**
    * The helper that shipped with this daemon, when one sits beside its own entrypoint.
@@ -210,8 +230,18 @@ export class LauncherBrowserHelperClient {
 
   async run(turn: BrowserTurn): Promise<string> {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+    console.info(`[chatgpt-web-helper-client] run begin trace=${turn.traceId}`);
     await this.ensureChild();
+    console.info(`[chatgpt-web-helper-client] helper ready trace=${turn.traceId} pid=${this.child?.pid ?? "none"}`);
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
+    if (turn.prepareBeforeHelper && !this.helperFeatures.has("prepared-run-prompt")) {
+      throw new Error(
+        "Launcher browser helper does not support prepared prompts in the initial run frame; update or restart the launcher",
+      );
+    }
+    if (turn.prepareBeforeHelper && turn.prepareResume) {
+      throw new Error("Launcher eager prompt preparation cannot be combined with retained-conversation continuation");
+    }
     if (turn.onMultipartStageAcknowledged && !this.helperFeatures.has("multipart-stage-ack")) {
       throw new Error(
         "Launcher browser helper does not support multipart acknowledgement forwarding; update or restart the launcher",
@@ -227,12 +257,56 @@ export class LauncherBrowserHelperClient {
         "Launcher browser helper does not support the MCP completion fence; update or restart the launcher",
       );
     }
+    const preparedBeforeHelper = turn.prepareBeforeHelper ? await turn.prepare() : undefined;
+    if (turn.abortSignal?.aborted) {
+      preparedBeforeHelper?.release();
+      throw new DOMException("ChatGPT web turn aborted", "AbortError");
+    }
+    let preparedRunFile: PreparedRunFile | undefined;
+    let preparedRunTempDir: string | undefined;
+    if (preparedBeforeHelper) {
+      const serialized = JSON.stringify({
+        text: preparedBeforeHelper.text,
+        images: preparedBeforeHelper.images,
+        ...(preparedBeforeHelper.turnToken ? { turnToken: preparedBeforeHelper.turnToken } : {}),
+        ...(preparedBeforeHelper.skillFiles ? { skillFiles: preparedBeforeHelper.skillFiles } : {}),
+        ...(preparedBeforeHelper.multipart ? { multipart: preparedBeforeHelper.multipart } : {}),
+        ...(preparedBeforeHelper.trimmedCompactionMessages !== undefined
+          ? { trimmedCompactionMessages: preparedBeforeHelper.trimmedCompactionMessages }
+          : {}),
+      } satisfies CompiledChatGptWebPrompt);
+      const bytes = Buffer.byteLength(serialized);
+      if (bytes >= PREPARED_RUN_FILE_THRESHOLD_BYTES) {
+        if (!this.helperFeatures.has("prepared-run-file")) {
+          preparedBeforeHelper.release();
+          throw new Error(
+            "Launcher browser helper does not support file-backed prepared prompts; update or restart the launcher",
+          );
+        }
+        preparedRunTempDir = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-prepared-"));
+        const path = join(preparedRunTempDir, "prompt.json");
+        writeFileSync(path, serialized, { encoding: "utf8", mode: 0o600 });
+        preparedRunFile = {
+          path,
+          bytes,
+          sha256: createHash("sha256").update(serialized).digest("hex"),
+        };
+      }
+    }
     return await new Promise<string>((resolveResult, rejectResult) => {
         if (this.pending.has(turn.traceId)) {
+          if (preparedRunTempDir) rmSync(preparedRunTempDir, { recursive: true, force: true });
+          preparedBeforeHelper?.release();
           rejectResult(new Error(`Duplicate launcher browser turn: ${turn.traceId}`));
           return;
         }
-        const pending: PendingTurn = { turn, resolve: resolveResult, reject: rejectResult };
+        const pending: PendingTurn = {
+          turn,
+          resolve: resolveResult,
+          reject: rejectResult,
+          ...(preparedBeforeHelper ? { prepared: preparedBeforeHelper } : {}),
+          ...(preparedRunTempDir ? { preparedRunTempDir } : {}),
+        };
         this.pending.set(turn.traceId, pending);
         if (turn.abortSignal) {
           const abortListener = () => {
@@ -268,6 +342,10 @@ export class LauncherBrowserHelperClient {
         pending.sent = true;
         const progressForwarding = new AbortController();
         pending.progressForwarding = progressForwarding;
+        console.info(
+          `[chatgpt-web-helper-client] dispatch trace=${turn.traceId} pid=${this.child?.pid ?? "none"}`
+          + ` preparedChars=${preparedBeforeHelper?.text.length ?? 0}`,
+        );
         void this.send({
           type: "run",
           id: turn.traceId,
@@ -293,11 +371,46 @@ export class LauncherBrowserHelperClient {
             ...(turn.compaction ? { compaction: true } : {}),
             ...(turn.captureLunaCheckpoint ? { captureLunaCheckpoint: true } : {}),
             ...(turn.externalProgress ? { externalProgress: true } : {}),
+            ...(turn.allowCompletionWithoutAction ? { allowCompletionWithoutAction: true } : {}),
           },
+          ...(preparedRunFile ? { preparedFile: preparedRunFile } : preparedBeforeHelper ? {
+            prepared: {
+              text: preparedBeforeHelper.text,
+              images: preparedBeforeHelper.images,
+              ...(preparedBeforeHelper.turnToken ? { turnToken: preparedBeforeHelper.turnToken } : {}),
+              ...(preparedBeforeHelper.skillFiles ? { skillFiles: preparedBeforeHelper.skillFiles } : {}),
+              ...(preparedBeforeHelper.multipart ? { multipart: preparedBeforeHelper.multipart } : {}),
+              ...(preparedBeforeHelper.trimmedCompactionMessages !== undefined
+                ? { trimmedCompactionMessages: preparedBeforeHelper.trimmedCompactionMessages }
+                : {}),
+            } satisfies CompiledChatGptWebPrompt,
+          } : {}),
         })
           // Only mirror once the run frame is on the wire, so the helper never sees progress for a
           // turn it has not been told about and cannot accumulate state for unknown ids.
           .then(() => {
+            console.info(`[chatgpt-web-helper-client] dispatch written trace=${turn.traceId} pid=${this.child?.pid ?? "none"}`);
+            if (this.helperFeatures.has("run-accepted")
+              && this.pending.get(turn.traceId) === pending
+              && !pending.runAccepted) {
+              pending.runAcceptanceTimer = setTimeout(() => {
+                if (this.pending.get(turn.traceId) !== pending || pending.runAccepted) return;
+                console.warn(
+                  `[chatgpt-web-helper-client] run acknowledgement timed out trace=${turn.traceId}`
+                  + ` pid=${this.child?.pid ?? "none"} timeoutMs=${this.runAcceptanceTimeoutMs}`,
+                );
+                this.finishWithError(turn.traceId, new ChatGptWebAdapterError(
+                  `Launcher browser helper did not acknowledge the run frame within ${this.runAcceptanceTimeoutMs}ms`,
+                  {
+                    status: 503,
+                    errorType: "server_error",
+                    code: "browser_helper_start_timeout",
+                    retryable: true,
+                  },
+                ));
+              }, this.runAcceptanceTimeoutMs);
+              pending.runAcceptanceTimer.unref?.();
+            }
             if (!progressForwarding.signal.aborted) this.forwardProgress(turn, progressForwarding.signal);
           })
           .catch(error => this.finishWithError(turn.traceId, error instanceof Error ? error : new Error(String(error))));
@@ -324,6 +437,7 @@ export class LauncherBrowserHelperClient {
       && this.child.exitCode === null
       && this.child.signalCode === null
       && this.ready) {
+      console.info(`[chatgpt-web-helper-client] reuse helper pid=${this.child.pid ?? "none"}`);
       return this.ready;
     }
     const descriptor = readLauncherBrowserHostDescriptor(this.config.browserHostDescriptorPath!);
@@ -341,6 +455,7 @@ export class LauncherBrowserHelperClient {
       },
     );
     this.child = child;
+    console.info(`[chatgpt-web-helper-client] spawned helper pid=${child.pid ?? "none"}`);
     this.ready = new Promise<void>((resolveReady, rejectReady) => {
       this.readyResolve = resolveReady;
       this.readyReject = rejectReady;
@@ -415,7 +530,16 @@ export class LauncherBrowserHelperClient {
     const pending = this.pending.get(message.id);
     if (!pending) return;
     if (message.type === "event") {
-      if (message.event === "heartbeat") pending.turn.onHeartbeat?.();
+      if (message.event === "run_accepted") {
+        pending.runAccepted = true;
+        if (pending.runAcceptanceTimer) clearTimeout(pending.runAcceptanceTimer);
+        pending.runAcceptanceTimer = undefined;
+        if (pending.preparedRunTempDir) {
+          rmSync(pending.preparedRunTempDir, { recursive: true, force: true });
+          pending.preparedRunTempDir = undefined;
+        }
+        console.info(`[chatgpt-web-helper-client] run accepted trace=${message.id} pid=${child.pid ?? "none"}`);
+      } else if (message.event === "heartbeat") pending.turn.onHeartbeat?.();
       else if (message.event === "generation_progress") pending.turn.onGenerationProgress?.();
       else if (message.event === "tool_batch_observed") {
         const progress = pending.turn.externalProgress;
@@ -563,10 +687,12 @@ export class LauncherBrowserHelperClient {
       return;
     }
     if (message.type === "result") {
+      console.info(`[chatgpt-web-helper-client] result trace=${message.id} pid=${child.pid ?? "none"}`);
       this.finish(message.id);
       if (pending.localFailure) pending.reject(pending.localFailure);
       else pending.resolve(message.text);
     } else if (message.type === "error") {
+      console.info(`[chatgpt-web-helper-client] error trace=${message.id} pid=${child.pid ?? "none"} message=${message.message}`);
       const error = message.status !== undefined
         ? new ChatGptWebAdapterError(message.message, {
           status: message.status,
@@ -636,6 +762,12 @@ export class LauncherBrowserHelperClient {
   private finish(id: string): void {
     const pending = this.pending.get(id);
     if (!pending) return;
+    if (pending.runAcceptanceTimer) clearTimeout(pending.runAcceptanceTimer);
+    pending.runAcceptanceTimer = undefined;
+    if (pending.preparedRunTempDir) {
+      rmSync(pending.preparedRunTempDir, { recursive: true, force: true });
+      pending.preparedRunTempDir = undefined;
+    }
     if (pending.abortListener && pending.turn.abortSignal) {
       pending.turn.abortSignal.removeEventListener("abort", pending.abortListener);
     }
@@ -733,11 +865,25 @@ export class LauncherBrowserHelperClient {
     if (child.stdin.destroyed || child.stdin.writableEnded) {
       throw new Error("Launcher browser helper input is closed");
     }
+    const meta = message && typeof message === "object" && !Array.isArray(message)
+      ? message as { type?: unknown; id?: unknown }
+      : {};
+    console.info(
+      `[chatgpt-web-helper-client] write begin pid=${child.pid ?? "none"}`
+      + ` type=${typeof meta.type === "string" ? meta.type : "unknown"}`
+      + ` id=${typeof meta.id === "string" ? meta.id : "none"}`
+      + ` bytes=${Buffer.byteLength(encoded)}`,
+    );
     await new Promise<void>((resolveWrite, rejectWrite) => {
       child.stdin.write(encoded, error => {
         if (error) rejectWrite(error);
         else resolveWrite();
       });
     });
+    console.info(
+      `[chatgpt-web-helper-client] write done pid=${child.pid ?? "none"}`
+      + ` type=${typeof meta.type === "string" ? meta.type : "unknown"}`
+      + ` id=${typeof meta.id === "string" ? meta.id : "none"}`,
+    );
   }
 }

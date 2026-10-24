@@ -1,3 +1,7 @@
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { resolve, sep } from "node:path";
 import { validateSkillFiles } from "./skill-attachments";
 import { createInterface } from "node:readline";
 import { stdin, stderr, stdout } from "node:process";
@@ -36,6 +40,13 @@ interface RunMessage {
     compaction?: boolean;
     captureLunaCheckpoint?: boolean;
     externalProgress?: boolean;
+    allowCompletionWithoutAction?: boolean;
+  };
+  prepared?: CompiledChatGptWebPrompt;
+  preparedFile?: {
+    path: string;
+    bytes: number;
+    sha256: string;
   };
 }
 
@@ -115,6 +126,30 @@ const completionFenceCommitWaiters = new Map<string, {
   reject: (error: Error) => void;
 }>();
 let completionFenceRequestId = 0;
+
+function loadPreparedRunFile(value: RunMessage["preparedFile"]): CompiledChatGptWebPrompt | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value.path !== "string" || !Number.isSafeInteger(value.bytes) || value.bytes <= 0
+    || typeof value.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.sha256)) {
+    throw new Error("Browser helper prepared prompt file metadata is invalid");
+  }
+  const root = resolve(tmpdir()) + sep;
+  const path = resolve(value.path);
+  if (!path.startsWith(root) || !path.split(sep).some(part => part.startsWith("codex-chatgpt-web-prepared-"))) {
+    throw new Error("Browser helper prepared prompt file is outside the private temporary directory");
+  }
+  const payload = readFileSync(path);
+  if (payload.byteLength !== value.bytes) throw new Error("Browser helper prepared prompt file size does not match");
+  const digest = createHash("sha256").update(payload).digest("hex");
+  if (digest !== value.sha256) throw new Error("Browser helper prepared prompt file digest does not match");
+  let prepared: unknown;
+  try { prepared = JSON.parse(payload.toString("utf8")); }
+  catch { throw new Error("Browser helper prepared prompt file is not valid JSON"); }
+  if (!prepared || typeof prepared !== "object" || Array.isArray(prepared)) {
+    throw new Error("Browser helper prepared prompt file does not contain a prompt object");
+  }
+  return prepared as CompiledChatGptWebPrompt;
+}
 let shuttingDown = false;
 let shutdownPromise: Promise<void> | undefined;
 
@@ -158,6 +193,11 @@ function requestShutdown(): Promise<void> {
 }
 
 async function run(message: RunMessage): Promise<void> {
+  if (message.prepared !== undefined && message.preparedFile !== undefined) {
+    throw new Error("Browser helper run cannot contain both inline and file-backed prepared prompts");
+  }
+  const initialPrepared = message.prepared ?? loadPreparedRunFile(message.preparedFile);
+  diagnostic(`[chatgpt-web-helper] run begin trace=${message.id} preparedChars=${initialPrepared?.text.length ?? 0}`);
   if (!/^[A-Za-z0-9_-]{6,128}$/.test(message.id) || message.id !== message.turn.traceId) {
     throw new Error("Browser helper turn identity is invalid");
   }
@@ -186,6 +226,31 @@ async function run(message: RunMessage): Promise<void> {
   }
   if (message.turn.externalProgress !== undefined && typeof message.turn.externalProgress !== "boolean") {
     throw new Error("Browser helper external progress flag is invalid");
+  }
+  if (message.turn.allowCompletionWithoutAction !== undefined
+    && typeof message.turn.allowCompletionWithoutAction !== "boolean") {
+    throw new Error("Browser helper completion-action override is invalid");
+  }
+  if (initialPrepared !== undefined) {
+    if (message.turn.resumeAvailable) {
+      throw new Error("Browser helper prepared run prompt cannot be combined with continuation selection");
+    }
+    if (typeof initialPrepared.text !== "string" || !Array.isArray(initialPrepared.images)) {
+      throw new Error("Browser helper prepared run prompt is invalid");
+    }
+    validateSkillFiles(initialPrepared.skillFiles);
+    if (initialPrepared.multipart !== undefined) {
+      const multipart = initialPrepared.multipart;
+      if (!multipart || !Array.isArray(multipart.parts)
+        || !isChatGptWebMultipartPartCount(multipart.parts.length)
+        || multipart.parts.some(part => typeof part !== "string")
+        || typeof multipart.commit !== "string") {
+        throw new Error("Browser helper prepared run multipart prompt is invalid");
+      }
+    }
+  }
+  if (!writeProtocol({ type: "event", id: message.id, event: "run_accepted" })) {
+    throw new Error("Browser helper could not acknowledge run acceptance");
   }
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
@@ -216,6 +281,7 @@ async function run(message: RunMessage): Promise<void> {
   if (progress) turnProgress.set(message.id, progress);
   const promptSelection = createBrowserHelperPromptSelection();
   preparedSelections.set(message.id, promptSelection);
+  if (initialPrepared !== undefined) promptSelection.select(initialPrepared);
   const prepareSelected = async () => ({ ...await promptSelection.wait(), release: () => {} });
   const turn: BrowserTurn = {
     traceId: message.turn.traceId,
@@ -231,6 +297,7 @@ async function run(message: RunMessage): Promise<void> {
     ...(message.turn.conversationKey ? { conversationKey: message.turn.conversationKey } : {}),
     abortSignal: abortController.signal,
     ...(message.turn.compaction ? { compaction: true } : {}),
+    ...(message.turn.allowCompletionWithoutAction ? { allowCompletionWithoutAction: true } : {}),
     ...(progress ? {
       externalProgress: progress,
       completionFence: {
@@ -264,12 +331,14 @@ async function run(message: RunMessage): Promise<void> {
     } : {}),
     onHeartbeat: () => writeProtocol({ type: "event", id: message.id, event: "heartbeat" }),
     onGenerationProgress: () => writeProtocol({ type: "event", id: message.id, event: "generation_progress" }),
-    onPreparedSelected: reused => {
-      if (!writeProtocol({ type: "event", id: message.id, event: "prepared_selected", reused })) {
-        throw new Error("Browser helper could not request prompt selection");
-      }
-      return promptSelection.wait().then(() => undefined);
-    },
+    ...(initialPrepared === undefined ? {
+      onPreparedSelected: (reused: boolean) => {
+        if (!writeProtocol({ type: "event", id: message.id, event: "prepared_selected", reused })) {
+          throw new Error("Browser helper could not request prompt selection");
+        }
+        return promptSelection.wait().then(() => undefined);
+      },
+    } : {}),
     onSendActivated: () => new Promise<void>((resolve, reject) => {
       if (sendActivationWaiters.has(message.id)) {
         reject(new Error("Browser helper Send activation already awaits acknowledgement"));
@@ -312,8 +381,10 @@ async function run(message: RunMessage): Promise<void> {
   };
   try {
     const text = await ChatGptBrowserWorker.forProvider(provider).run(turn);
+    diagnostic(`[chatgpt-web-helper] run result trace=${message.id} answerChars=${text.length}`);
     writeProtocol({ type: "result", id: message.id, text });
   } catch (error) {
+    diagnostic(`[chatgpt-web-helper] run error trace=${message.id} message=${error instanceof Error ? error.message : String(error)}`);
     writeProtocol({
       type: "error",
       id: message.id,
@@ -327,6 +398,7 @@ async function run(message: RunMessage): Promise<void> {
       } : {}),
     });
   } finally {
+    diagnostic(`[chatgpt-web-helper] run cleanup trace=${message.id}`);
     preparedSelections.get(message.id)?.cancel();
     preparedSelections.delete(message.id);
     const sendWaiter = sendActivationWaiters.get(message.id);
@@ -538,4 +610,13 @@ process.once("SIGTERM", () => {
 });
 
 // Advertise the optional frames this helper understands so the daemon can negotiate them explicitly.
-writeProtocol({ type: "ready", features: ["progress", "tool-boundary-ack", "completion-fence", "multipart-stage-ack", "skill-attachments"] });
+writeProtocol({ type: "ready", features: [
+  "progress",
+  "tool-boundary-ack",
+  "completion-fence",
+  "multipart-stage-ack",
+  "skill-attachments",
+  "prepared-run-prompt",
+  "prepared-run-file",
+  "run-accepted",
+] });

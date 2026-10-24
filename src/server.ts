@@ -22,6 +22,7 @@ import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compactio
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
 import type { AppConfig } from "./config";
 import { providerConfig } from "./config";
+import { browserResponsesRequest } from "./browser-responses";
 import { AsyncEventQueue } from "./event-queue";
 import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
@@ -53,7 +54,7 @@ import type { CodexProviderConfig } from "./types";
 import type { ProviderAdapter } from "./adapters/base";
 import { VERSION } from "./version";
 
-type HttpTrackedEndpoint = "models" | "responses" | "compact" | "search" | "unspecified" | NativeImageEndpoint;
+type HttpTrackedEndpoint = "models" | "responses" | "browser_responses" | "compact" | "search" | "unspecified" | NativeImageEndpoint;
 
 export interface NativeCodexTurnIdentity {
   threadId: string;
@@ -1235,6 +1236,18 @@ export function startServer(
           status: 426,
           headers: { "content-type": "text/plain; charset=utf-8" },
         });
+      }
+      if (req.method === "POST" && url.pathname === "/v1/browser/responses") {
+        if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
+        console.info(
+          `[browser-responses] http received contentLength=${req.headers.get("content-length") ?? "unknown"}`,
+        );
+        return httpTurns.track(
+          signal => browserResponsesRequest(new Request(req, { signal }), config),
+          req.signal,
+          process.platform,
+          "browser_responses",
+        );
       }
       if (req.method === "POST" && url.pathname === "/v1/responses") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");

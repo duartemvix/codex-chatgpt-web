@@ -167,6 +167,10 @@ export const CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS = 60_000;
 export const MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS = 3;
 const CHATGPT_CONNECTOR_MENTION_QUERY = "@codex";
 const CHATGPT_CONNECTOR_ACTION_TIMEOUT_MS = 10_000;
+// ChatGPT's Lexical composer can wedge the renderer when one execCommand inserts a very large
+// prompt. Keep each browser editing task small enough to yield between chunks while preserving the
+// exact plain-text transport semantics that avoid Markdown-rich-text rewrites.
+const CHATGPT_PROMPT_INSERT_CHUNK_CHARS = 16_384;
 const CHATGPT_SMOKE_TEXT = "Reply with exactly: CODEX WEB GPT READY";
 const CHATGPT_SMOKE_EXPECTED = "CODEX WEB GPT READY";
 /**
@@ -1052,6 +1056,17 @@ export interface BrowserTurn {
   capabilities: ChatGptWebCapabilities;
   prepare: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
   prepareResume?: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
+  /**
+   * Launcher-only transport hint for one-shot callers that already have their complete prompt.
+   * When supported by the helper, prepare before dispatch and carry the prompt in the initial run
+   * frame so the turn cannot stall between browser lease acquisition and prompt-selection IPC.
+   */
+  prepareBeforeHelper?: boolean;
+  /**
+   * One-shot raw inference has no tools or continuation state. If ChatGPT renders a stable answer
+   * and generation has stopped, allow completion even when the UI omits its normal action row.
+   */
+  allowCompletionWithoutAction?: boolean;
   /** Select the Codex Native connector without advertising the ordinary turn tool environment. */
   nativeConnector?: boolean;
   retainConversation?: boolean;
@@ -1166,6 +1181,25 @@ export function chatGptTurnIsComplete(state: {
     && state.completionActionVisible;
 }
 
+/**
+ * Raw one-shot inference may not get ChatGPT's normal completed-turn action row. In that mode,
+ * the visible answer plus a stopped UI is enough to start the normal stability timer. Do not let
+ * the conversation SSE keep this false: ChatGPT can leave that request open after the rendered
+ * turn is already finished, which would otherwise strand the HTTP response indefinitely.
+ */
+export function chatGptEffectiveCompletionActionVisible(state: {
+  completionActionVisible: boolean;
+  allowCompletionWithoutAction?: boolean;
+  running: boolean;
+  currentText: string;
+  responseStreamActive?: boolean;
+}): boolean {
+  return state.completionActionVisible || (
+    state.allowCompletionWithoutAction === true
+    && !state.running
+    && state.currentText.length > 0
+  );
+}
 export type ChatGptSubmissionEvidence = "user_turn" | "assistant_turn" | "generation_running" | "mcp_tool_call";
 
 export function chatGptSubmissionEvidence(state: {
@@ -2038,6 +2072,31 @@ export class ChatGptBrowserWorker {
     return worker;
   }
 
+  /**
+   * Dedicated shared worker for raw one-shot browser responses. Raw inference must not share
+   * native Codex conversation state, but it does benefit from the launcher's multiplexed helper
+   * process so several independent temporary chats can run in parallel.
+   */
+  static forRawResponses(provider: CodexProviderConfig): ChatGptBrowserWorker {
+    const config = resolveBrowserConfig(provider);
+    const key = `raw-responses:${JSON.stringify(config)}`;
+    let worker = workers.get(key);
+    if (!worker) {
+      worker = new ChatGptBrowserWorker(config);
+      workers.set(key, worker);
+    }
+    return worker;
+  }
+
+  /**
+   * Creates a worker whose launcher-helper lifecycle belongs to one caller instead of the shared
+   * provider cache. Raw workflow inference uses this because every request is an independent,
+   * temporary ChatGPT turn and must not inherit helper-process state from an earlier request.
+   */
+  static createIsolated(provider: CodexProviderConfig): ChatGptBrowserWorker {
+    return new ChatGptBrowserWorker(resolveBrowserConfig(provider));
+  }
+
   private browser?: Browser;
   private context?: BrowserContext;
   private page?: Page;
@@ -2515,13 +2574,27 @@ export class ChatGptBrowserWorker {
     let count = 0;
     while (Date.now() < deadline) {
       throwIfPromptAttachmentAborted(abortSignal);
-      count = await withBrowserTurnAbort(
-        withChatGptBrowserObservationTimeout(
-          composers.count(),
-          Math.max(1, Math.min(CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, deadline - Date.now())),
-        ),
-        abortSignal,
-      );
+      try {
+        count = await withBrowserTurnAbort(
+          withChatGptBrowserObservationTimeout(
+            composers.count(),
+            Math.max(1, Math.min(CHATGPT_BROWSER_OBSERVATION_PROBE_TIMEOUT_MS, deadline - Date.now())),
+          ),
+          abortSignal,
+        );
+      } catch (error) {
+        // A newly opened Temporary Chat can briefly expose a hydrating textarea while Playwright's
+        // selector observation is stalled. That is a transient readiness miss, not a failed turn.
+        // Keep the individual DOM probe bounded, but let the existing composer readiness window
+        // absorb isolated observation stalls instead of aborting the whole browser request.
+        if (!(error instanceof ChatGptBrowserObservationTimeoutError)) throw error;
+        if (Date.now() >= deadline) break;
+        await withBrowserTurnAbort(
+          new Promise(resolveSleep => setTimeout(resolveSleep, 50)),
+          abortSignal,
+        );
+        continue;
+      }
       if (count === 1) return composers.first();
       await withBrowserTurnAbort(
         new Promise(resolveSleep => setTimeout(resolveSleep, 50)),
@@ -3879,17 +3952,36 @@ export class ChatGptBrowserWorker {
     // CDP Input.insertText is interpreted as live typing by ChatGPT's Lexical plugins. On a large
     // JSON transport it can turn literal Markdown backticks into rich code nodes, remove the
     // delimiters from textContent, and leave the next insertion outside the intended block. The
-    // browser's plain-text editing command updates the same focused contenteditable atomically
-    // without running those Markdown shortcuts. Exact readback below remains the authority.
-    const inserted = await composer.evaluate(insertPlainTextIntoComposer, text, {
-      timeout: 20_000,
-      signal: abortSignal,
-    });
-    throwIfPromptAttachmentAborted(abortSignal);
-    if (!inserted) {
-      throw new ChatGptPromptAttachmentIntegrityError(
-        "ChatGPT composer rejected the plain-text editing command",
-      );
+    // browser's plain-text editing command updates the same focused contenteditable without
+    // running those Markdown shortcuts. A single 100k+ character execCommand can monopolize the
+    // renderer until the whole prompt-attachment stage expires, leaving a blank composer. Split
+    // large prompts into bounded editing tasks so Chromium can service the editor between chunks.
+    // Exact readback after the complete insertion remains the authority.
+    for (let start = 0; start < text.length;) {
+      throwIfPromptAttachmentAborted(abortSignal);
+      let end = Math.min(text.length, start + CHATGPT_PROMPT_INSERT_CHUNK_CHARS);
+      // Do not split a UTF-16 surrogate pair across two browser editing commands.
+      if (
+        end < text.length
+        && end > start
+        && text.charCodeAt(end - 1) >= 0xD800
+        && text.charCodeAt(end - 1) <= 0xDBFF
+        && text.charCodeAt(end) >= 0xDC00
+        && text.charCodeAt(end) <= 0xDFFF
+      ) {
+        end -= 1;
+      }
+      const inserted = await composer.evaluate(insertPlainTextIntoComposer, text.slice(start, end), {
+        timeout: 20_000,
+        signal: abortSignal,
+      });
+      throwIfPromptAttachmentAborted(abortSignal);
+      if (!inserted) {
+        throw new ChatGptPromptAttachmentIntegrityError(
+          `ChatGPT composer rejected the plain-text editing command at character ${start}`,
+        );
+      }
+      start = end;
     }
   }
 
@@ -5355,6 +5447,15 @@ export class ChatGptBrowserWorker {
           );
           break;
         } catch (error) {
+          if (
+            error instanceof Error
+            && error.message === "ChatGPT browser stage timed out: prompt_attachment"
+          ) {
+            throw new ChatGptPromptAttachmentIntegrityError(
+              "ChatGPT prompt attachment timed out before submission",
+              error,
+            );
+          }
           if (!(error instanceof ChatGptConnectorCatalogStaleError) || !catalogRefreshAvailable) throw error;
           catalogRefreshAvailable = false;
           await diagnostics.capture(page, "connector-catalog-stale");
@@ -5630,11 +5731,18 @@ export class ChatGptBrowserWorker {
             else turn.onReasoningSummary?.(trace.text, trace.continuation === true);
           }
           if (textDelta) emitMarkdownDelta(textDelta);
+          const completionActionVisible = chatGptEffectiveCompletionActionVisible({
+            completionActionVisible: snapshot.completionActionVisible,
+            allowCompletionWithoutAction: turn.allowCompletionWithoutAction,
+            running,
+            currentText: snapshot.visibleText,
+            responseStreamActive,
+          });
           const domError = domHealthTracker.update({
             responsePresent: snapshot.responsePresent,
             running,
             currentText: snapshot.visibleText,
-            completionActionVisible: snapshot.completionActionVisible,
+            completionActionVisible,
             externalProgressLive,
             responseStreamActive,
             activityText: JSON.stringify(snapshot.traceBlocks),
@@ -5645,7 +5753,7 @@ export class ChatGptBrowserWorker {
             running,
             currentText: snapshot.visibleText,
             currentHtml: snapshot.fullHtml,
-            completionActionVisible: snapshot.completionActionVisible,
+            completionActionVisible,
             externalToolCallsInFlight,
           });
           if (!completionReady) completionFenceRevision = undefined;

@@ -1,6 +1,6 @@
 import { selectedSkillFile } from "../src/adapters/chatgpt-web/skill-attachments";
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChatGptCompactionHandoffAccepted, ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
@@ -165,6 +165,69 @@ test("daemon streams browser lifecycle through the real helper process", async (
       },
     }]);
     expect(released).toBe(true);
+  } finally {
+    await client.close();
+  }
+});
+
+test("real helper process loads large eager prompts through the private file handoff", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-helper-file-handoff-"));
+  roots.push(root);
+  const helper = join(root, "helper.ts");
+  const marker = "SCOREFIT_FILE_HANDOFF_MARKER";
+  writeFileSync(helper, `
+    import { ChatGptBrowserWorker } from ${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-worker.ts", import.meta.url).href)};
+    ChatGptBrowserWorker.prototype.run = async function(turn) {
+      const prepared = await turn.prepare();
+      if (prepared.text.length < 100_000) throw new Error("Large prepared prompt was truncated");
+      if (!prepared.text.includes(${JSON.stringify(marker)})) throw new Error("Large prepared prompt marker was lost");
+      return "done";
+    };
+    await import(${JSON.stringify(new URL("../src/adapters/chatgpt-web/browser-helper-main.ts", import.meta.url).href)});
+  `, { mode: 0o700 });
+  const descriptorPath = join(root, "launcher.json");
+  writeFileSync(descriptorPath, `${JSON.stringify({
+    version: 3,
+    kind: LAUNCHER_BROWSER_HOST_KIND,
+    profile: "production",
+    pid: process.pid,
+    endpoint: "http://127.0.0.1:39001",
+    control: {
+      endpoint: "http://127.0.0.1:39002",
+      token: "launcher-control-token-0123456789abcdefghijklmnop",
+    },
+    helper: { executable: process.execPath, script: helper },
+    partition: "persist:codex-web-gpt-chatgpt",
+    idleUrl: LAUNCHER_BROWSER_IDLE_URL,
+    surfaceId: "launcher_surface_id_0123456789AB",
+    surfaceTargets: { ["launcher_surface_id_0123456789AB"]: "native-owned-target" },
+    createdAt: new Date().toISOString(),
+  })}\n`, { mode: 0o600 });
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native2",
+    browserHost: "launcher",
+    browserHostDescriptorPath: descriptorPath,
+    browserHelperScriptPath: helper,
+    storageStatePath: join(root, "unused-state.json"),
+    chromeExecutablePath: join(root, "unused-chrome"),
+    turnTimeoutMs: 60_000,
+    headed: true,
+    autoApproveToolCalls: false,
+    useSavedChats: false,
+  });
+  const prompt = `${marker}\n` + "[company]|Markdown \\\\ payload — café\n".repeat(4_000);
+  let released = false;
+  try {
+    await expect(client.run({
+      traceId: "raw-file-process-123",
+      modelId: "gpt-5.6-sol",
+      reasoning: "high",
+      capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+      prepareBeforeHelper: true,
+      prepare: async () => ({ text: prompt, images: [], release: () => { released = true; } }),
+      onTextDelta() {},
+    })).resolves.toBe("done");
+    expect(released).toBeTrue();
   } finally {
     await client.close();
   }
@@ -389,6 +452,164 @@ test("an abort dispatched during run submission cannot overtake the run frame", 
 
   expect(messages).toEqual(["run", "abort"]);
   expect(released).toBe(false);
+});
+
+test("one-shot prepared prompts require the helper to acknowledge the initial run frame", async () => {
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native",
+    browserHost: "launcher",
+    browserHostDescriptorPath: "/durable/launcher.json",
+    storageStatePath: "/durable/unused-state.json",
+    chromeExecutablePath: "/durable/unused-chrome",
+    turnTimeoutMs: 60_000,
+    headed: true,
+    autoApproveToolCalls: false,
+    useSavedChats: false,
+  });
+  const internal = client as unknown as {
+    child: unknown;
+    helperFeatures: Set<string>;
+    ensureChild(): Promise<void>;
+    send(message: Record<string, any>): Promise<void>;
+    handleLine(child: unknown, line: string): void;
+  };
+  const child = {};
+  internal.child = child;
+  internal.helperFeatures = new Set(["prepared-run-prompt", "run-accepted"]);
+  internal.ensureChild = async () => {};
+  const sent: Record<string, any>[] = [];
+  internal.send = async message => {
+    sent.push(message);
+    if (message.type === "run") queueMicrotask(() => {
+      internal.handleLine(child, JSON.stringify({
+        type: "event",
+        id: message.id,
+        event: "run_accepted",
+      }));
+      internal.handleLine(child, JSON.stringify({
+        type: "result",
+        id: message.id,
+        text: "done",
+      }));
+    });
+  };
+  let prepareCalls = 0;
+  let released = false;
+
+  await expect(client.run({
+    traceId: "raw-prepared-123",
+    modelId: "gpt-5.6-sol",
+    reasoning: "high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    prepareBeforeHelper: true,
+    prepare: async () => {
+      prepareCalls += 1;
+      return { text: "# Master prompt\n\nCompany input", images: [], release: () => { released = true; } };
+    },
+    onTextDelta: () => {},
+  })).resolves.toBe("done");
+
+  expect(prepareCalls).toBe(1);
+  expect(released).toBeTrue();
+  expect(sent).toHaveLength(1);
+  expect(sent[0]).toMatchObject({
+    type: "run",
+    id: "raw-prepared-123",
+    prepared: { text: "# Master prompt\n\nCompany input", images: [] },
+  });
+});
+
+test("large one-shot prepared prompts use a private file-backed helper handoff", async () => {
+  const client = new LauncherBrowserHelperClient({
+    appName: "Codex Native",
+    browserHost: "launcher",
+    browserHostDescriptorPath: "/durable/launcher.json",
+    storageStatePath: "/durable/unused-state.json",
+    chromeExecutablePath: "/durable/unused-chrome",
+    turnTimeoutMs: 60_000,
+    headed: true,
+    autoApproveToolCalls: false,
+    useSavedChats: false,
+  });
+  const internal = client as unknown as {
+    child: unknown;
+    helperFeatures: Set<string>;
+    ensureChild(): Promise<void>;
+    send(message: Record<string, any>): Promise<void>;
+    handleLine(child: unknown, line: string): void;
+  };
+  const child = {};
+  internal.child = child;
+  internal.helperFeatures = new Set(["prepared-run-prompt", "prepared-run-file", "run-accepted"]);
+  internal.ensureChild = async () => {};
+  const prompt = "# Master prompt\n\n" + "Company | markdown \\\\ data — café\n".repeat(4_000);
+  let preparedPath = "";
+  let observedText = "";
+  internal.send = async message => {
+    if (message.type !== "run") return;
+    expect(message.prepared).toBeUndefined();
+    expect(message.preparedFile?.bytes).toBeGreaterThan(32 * 1024);
+    preparedPath = message.preparedFile.path;
+    const prepared = JSON.parse(readFileSync(preparedPath, "utf8"));
+    observedText = prepared.text;
+    queueMicrotask(() => {
+      internal.handleLine(child, JSON.stringify({ type: "event", id: message.id, event: "run_accepted" }));
+      internal.handleLine(child, JSON.stringify({ type: "result", id: message.id, text: "done" }));
+    });
+  };
+
+  await expect(client.run({
+    traceId: "raw-file-prepared-123",
+    modelId: "gpt-5.6-sol",
+    reasoning: "high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    prepareBeforeHelper: true,
+    prepare: async () => ({ text: prompt, images: [], release() {} }),
+    onTextDelta() {},
+  })).resolves.toBe("done");
+
+  expect(observedText).toBe(prompt);
+  expect(preparedPath).not.toBe("");
+  expect(existsSync(preparedPath)).toBeFalse();
+});
+
+test("an unacknowledged prepared run fails fast as retryable instead of hanging", async () => {
+  const config: ResolvedBrowserConfig = {
+    appName: "Codex Native",
+    browserHost: "launcher",
+    browserHostDescriptorPath: "/durable/launcher.json",
+    storageStatePath: "/durable/unused-state.json",
+    chromeExecutablePath: "/durable/unused-chrome",
+    turnTimeoutMs: 60_000,
+    headed: true,
+    autoApproveToolCalls: false,
+    useSavedChats: false,
+  };
+  const client = new LauncherBrowserHelperClient(config, 20);
+  const internal = client as unknown as {
+    child: unknown;
+    helperFeatures: Set<string>;
+    ensureChild(): Promise<void>;
+    send(message: Record<string, any>): Promise<void>;
+  };
+  internal.child = {};
+  internal.helperFeatures = new Set(["prepared-run-prompt", "run-accepted"]);
+  internal.ensureChild = async () => {};
+  internal.send = async () => {};
+
+  await expect(client.run({
+    traceId: "raw-unacked-123",
+    modelId: "gpt-5.6-sol",
+    reasoning: "high",
+    capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
+    prepareBeforeHelper: true,
+    prepare: async () => ({ text: "score companies", images: [], release() {} }),
+    onTextDelta() {},
+  })).rejects.toMatchObject({
+    status: 503,
+    code: "browser_helper_start_timeout",
+    retryable: true,
+  });
 });
 
 test("structured helper errors preserve the ChatGPT adapter failure contract", async () => {

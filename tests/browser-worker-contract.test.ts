@@ -1154,6 +1154,33 @@ test("active composer resolution waits for exactly one visible editor", async ()
   expect(await activeComposer.call({}, page, 500)).toBe(composer);
 });
 
+test("active composer resolution retries a transient DOM observation timeout", async () => {
+  const composer = { id: "active" };
+  let observations = 0;
+  const visibleComposers = {
+    count: async () => {
+      observations += 1;
+      if (observations === 1) throw new ChatGptBrowserObservationTimeoutError(5_000);
+      return 1;
+    },
+    first: () => composer,
+  };
+  const page = {
+    locator: () => ({
+      filter: (options: { visible: boolean }) => {
+        expect(options).toEqual({ visible: true });
+        return visibleComposers;
+      },
+    }),
+  };
+  const activeComposer = (ChatGptBrowserWorker.prototype as unknown as {
+    activeComposer(page: unknown, timeoutMs?: number): Promise<unknown>;
+  }).activeComposer;
+
+  expect(await activeComposer.call({}, page, 500)).toBe(composer);
+  expect(observations).toBe(2);
+});
+
 test("composer verification ignores icon markup while preserving the exact prompt and live editor", async () => {
   const { createWindow } = require("@mixmark-io/domino");
   const links = Array.from({ length: 6 }, (_, index) => `https://drive.google.com/file/d/example-${index}`);
@@ -1244,7 +1271,7 @@ test("prompt verification accepts Lexical NBSP preservation without weakening ot
   ).resolves.toBeUndefined();
 });
 
-test("large Markdown-rich context uses one plain-text editing command before exact verification", async () => {
+test("large Markdown-rich context uses bounded plain-text editing commands before exact verification", async () => {
   const prompt = [
     "Act as the model backend for the Codex task encoded below.",
     "```ts",
@@ -1278,11 +1305,38 @@ test("large Markdown-rich context uses one plain-text editing command before exa
   }, dialogPage("").page, prompt, false);
 
   expect(calls[0]).toEqual(["fill", ""]);
-  expect(calls.filter(call => call[0] === "evaluate")).toEqual([["evaluate", prompt]]);
-  expect(calls.filter(call => call[0] === "evaluateOptions")).toEqual([
-    ["evaluateOptions", { timeout: 20_000 }],
-  ]);
+  const insertedChunks = calls
+    .filter(call => call[0] === "evaluate")
+    .map(call => call[1] as string);
+  expect(insertedChunks.length).toBeGreaterThan(1);
+  expect(insertedChunks.every(chunk => chunk.length <= 16_384)).toBeTrue();
+  expect(insertedChunks.join("")).toBe(prompt);
+  expect(calls.filter(call => call[0] === "evaluateOptions").every(call => (
+    JSON.stringify(call[1]) === JSON.stringify({ timeout: 20_000 })
+  ))).toBeTrue();
   expect(asserted).toBe(prompt);
+});
+
+test("large prompt insertion observes cancellation between editing chunks", async () => {
+  const controller = new AbortController();
+  let edits = 0;
+  const insertPromptText = (ChatGptBrowserWorker.prototype as unknown as {
+    insertPromptText(page: unknown, text: string, abortSignal?: AbortSignal): Promise<void>;
+  }).insertPromptText;
+  const composer = {
+    focus: async () => {},
+    evaluate: async () => {
+      edits += 1;
+      controller.abort();
+      return true;
+    },
+  };
+
+  await expect(insertPromptText.call({
+    activeComposer: async () => composer,
+  }, {}, "x".repeat(40_000), controller.signal))
+    .rejects.toMatchObject({ name: "AbortError" });
+  expect(edits).toBe(1);
 });
 
 test("plain-text editing command fails closed when the focused composer rejects it", async () => {
