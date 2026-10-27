@@ -19,6 +19,15 @@ import { compileChatGptWebPrompt, formatChatGptWebMultipartCommit, formatChatGpt
 import { estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
 import { estimateTokens } from "../src/lib/token-estimate";
 import { chatGptHtmlToMarkdown } from "../src/adapters/chatgpt-web/markdown";
+import { promptAttachmentTimeoutMs } from "../src/adapters/chatgpt-web/browser-worker";
+
+test("prompt attachment budget scales with the number of editor chunks", () => {
+  expect(promptAttachmentTimeoutMs(1)).toBe(60_000);
+  expect(promptAttachmentTimeoutMs(16_384)).toBe(60_000);
+  expect(promptAttachmentTimeoutMs(16_385)).toBe(90_000);
+  expect(promptAttachmentTimeoutMs(65_536)).toBe(150_000);
+  expect(promptAttachmentTimeoutMs(200_000)).toBe(180_000);
+});
 
 test("unavailable Pro detail reads only its linked tooltip in any language", async () => {
   const { createWindow } = require("@mixmark-io/domino");
@@ -1317,6 +1326,106 @@ test("large Markdown-rich context uses bounded plain-text editing commands befor
   expect(asserted).toBe(prompt);
 });
 
+test("large one-shot prompts can use native clipboard paste instead of Lexical chunk insertion", async () => {
+  const prompt = "scorefit ".repeat(5_000);
+  const calls: Array<[string, unknown?]> = [];
+  const composer = {
+    fill: async (value: string) => { calls.push(["fill", value]); },
+    focus: async () => { calls.push(["focus"]); },
+  };
+  const attachPrompt = (ChatGptBrowserWorker.prototype as unknown as {
+    attachPrompt(
+      page: unknown,
+      prompt: string,
+      localTools: boolean,
+      captureDiagnostic?: unknown,
+      abortSignal?: AbortSignal,
+      catalogRefreshAvailable?: boolean,
+      connectorAttemptBudget?: unknown,
+      requireThink?: boolean,
+      preferClipboardPaste?: boolean,
+      clipboardPasteTraceId?: string,
+    ): Promise<void>;
+  }).attachPrompt;
+
+  await attachPrompt.call({
+    config: { browserHost: "launcher", browserHostDescriptorPath: "/tmp/browser-host.json" },
+    activeComposer: async () => composer,
+    pastePromptText: async (traceId: string, value: string) => {
+      calls.push(["paste", `${traceId}:${value.length}`]);
+      return "paste-lease-one-shot";
+    },
+    assertClipboardPromptAttached: async (_page: unknown, value: string) => calls.push(["assertClipboard", value.length]),
+    releasePromptPaste: async (traceId: string, pasteId: string) => calls.push(["releasePaste", `${traceId}:${pasteId}`]),
+    insertPromptText: async () => { throw new Error("chunk insertion must not run"); },
+    assertPromptAttached: async () => { throw new Error("text assertion must not run"); },
+  }, dialogPage("").page, prompt, false, undefined, undefined, false, undefined, false, true, "scorefit-trace");
+
+  expect(calls).toEqual([
+    ["fill", ""],
+    ["focus"],
+    ["paste", `scorefit-trace:${prompt.length}`],
+    ["assertClipboard", prompt.length],
+    ["releasePaste", "scorefit-trace:paste-lease-one-shot"],
+  ]);
+});
+
+test("clipboard prompt readiness waits for Send after exact composer text appears", async () => {
+  const prompt = "clipboard prompt";
+  let sendChecks = 0;
+  const attachmentSurface = { count: async () => 0 };
+  const send = {
+    isEnabled: async () => {
+      sendChecks += 1;
+      return sendChecks >= 2;
+    },
+  };
+  const composerForm = {
+    locator: (selector: string) => selector === ".composer-attachment-surface" ? attachmentSurface : send,
+  };
+  const composer = { locator: () => composerForm };
+  const assertClipboardPromptAttached = (ChatGptBrowserWorker.prototype as unknown as {
+    assertClipboardPromptAttached(page: unknown, prompt: string, abortSignal?: AbortSignal): Promise<void>;
+  }).assertClipboardPromptAttached;
+
+  await assertClipboardPromptAttached.call({
+    activeComposer: async () => composer,
+    attachedPromptText: async () => prompt,
+    promptTextEquivalent: (expected: string, observed: string) => expected === observed,
+    promptEquivalentPrefixLength: () => prompt.length,
+  }, {}, prompt);
+
+  expect(sendChecks).toBe(2);
+});
+
+test("clipboard attachment readiness waits for Send after the attachment surface appears", async () => {
+  const prompt = "clipboard attachment";
+  let sendChecks = 0;
+  const attachmentSurface = { count: async () => 1 };
+  const send = {
+    isEnabled: async () => {
+      sendChecks += 1;
+      return sendChecks >= 2;
+    },
+  };
+  const composerForm = {
+    locator: (selector: string) => selector === ".composer-attachment-surface" ? attachmentSurface : send,
+  };
+  const composer = { locator: () => composerForm };
+  const assertClipboardPromptAttached = (ChatGptBrowserWorker.prototype as unknown as {
+    assertClipboardPromptAttached(page: unknown, prompt: string, abortSignal?: AbortSignal): Promise<void>;
+  }).assertClipboardPromptAttached;
+
+  await assertClipboardPromptAttached.call({
+    activeComposer: async () => composer,
+    attachedPromptText: async () => "",
+    promptTextEquivalent: () => false,
+    promptEquivalentPrefixLength: () => 0,
+  }, {}, prompt);
+
+  expect(sendChecks).toBe(2);
+});
+
 test("large prompt insertion observes cancellation between editing chunks", async () => {
   const controller = new AbortController();
   let edits = 0;
@@ -2098,6 +2207,195 @@ test("tool-capable prompts use the shared Playwright connector selection before 
     ["plainText", " context"],
     ["assertPrompt"],
   ]);
+});
+
+test("large tool-capable prompts select the connector before native clipboard paste", async () => {
+  const controller = new AbortController();
+  const prompt = "codex context line\n".repeat(3_000);
+  const calls: Array<[string, string?]> = [];
+  const selectedComposer = {
+    focus: async (options?: { signal?: AbortSignal }) => {
+      expect(options?.signal).toBeDefined();
+      calls.push(["focus"]);
+    },
+    press: async (value: string, options?: { signal?: AbortSignal }) => {
+      expect(options?.signal).toBeDefined();
+      calls.push(["press", value]);
+    },
+  };
+  const attachPrompt = (ChatGptBrowserWorker.prototype as unknown as {
+    attachPrompt(
+      page: unknown,
+      prompt: string,
+      localTools: boolean,
+      captureDiagnostic?: unknown,
+      abortSignal?: AbortSignal,
+      catalogRefreshAvailable?: boolean,
+      connectorAttemptBudget?: unknown,
+      requireThink?: boolean,
+      preferClipboardPaste?: boolean,
+      clipboardPasteTraceId?: string,
+    ): Promise<void>;
+  }).attachPrompt;
+
+  await attachPrompt.call({
+    config: {
+      appName: "Codex Native2",
+      browserHost: "launcher",
+      browserHostDescriptorPath: "/tmp/browser-host.json",
+    },
+    selectConnector: async () => {
+      calls.push(["selectConnector"]);
+      return selectedComposer;
+    },
+    pastePromptText: async (traceId: string, text: string) => {
+      expect(traceId).toBe("codex-clipboard-trace");
+      expect(text).toBe(prompt);
+      calls.push(["paste", String(text.length)]);
+      return "paste-lease-tool";
+    },
+    assertClipboardPromptAttached: async (_page: unknown, text: string) => {
+      expect(text).toBe(prompt);
+      calls.push(["assertClipboard"]);
+    },
+    releasePromptPaste: async (traceId: string, pasteId: string) => {
+      expect(traceId).toBe("codex-clipboard-trace");
+      expect(pasteId).toBe("paste-lease-tool");
+      calls.push(["releasePaste"]);
+    },
+    connectorIsSelected: async (composer: unknown) => {
+      expect(composer).toBe(selectedComposer);
+      calls.push(["verifyConnector"]);
+      return true;
+    },
+    insertPromptText: async () => { throw new Error("chunk insertion must not run"); },
+    assertPromptAttached: async () => { throw new Error("plain text assertion must not run"); },
+    clearChatGptComposerState: async () => {},
+  }, dialogPage("").page, prompt, true, undefined, controller.signal, false, undefined, false, true, "codex-clipboard-trace");
+
+  expect(calls).toEqual([
+    ["selectConnector"],
+    ["focus"],
+    ["press", CHATGPT_COMPOSER_DOCUMENT_END_KEY],
+    ["paste", String(prompt.length)],
+    ["assertClipboard"],
+    ["releasePaste"],
+    ["verifyConnector"],
+  ]);
+});
+
+test("an aborted connector proof clears its mention before the preflight releases the browser page", async () => {
+  const controller = new AbortController();
+  const fillSignals: AbortSignal[] = [];
+  const calls: string[] = [];
+  const absent = {
+    filter: () => absent,
+    count: async () => 0,
+  };
+  const appResult = {
+    waitFor: async ({ signal }: { signal?: AbortSignal }) => {
+      expect(signal).toBeDefined();
+      calls.push("proof-wait");
+      controller.abort();
+      throw new DOMException("proof aborted", "AbortError");
+    },
+  };
+  const menuRows = {
+    filter: () => appResult,
+  };
+  const composer = {
+    fill: async (_value: string, { signal }: { signal?: AbortSignal }) => {
+      expect(signal).toBeDefined();
+      fillSignals.push(signal!);
+      calls.push(controller.signal.aborted ? "cleanup-fill" : "probe-fill");
+    },
+    focus: async () => { calls.push("focus"); },
+    press: async (key: string, { signal }: { signal?: AbortSignal }) => {
+      expect(signal?.aborted).toBeFalse();
+      calls.push(key === CHATGPT_COMPOSER_SELECT_ALL_KEY ? "cleanup-select-all" : "cleanup-backspace");
+    },
+    pressSequentially: async () => { calls.push("type"); },
+    evaluate: async () => { calls.push("cleanup-read"); return ""; },
+  };
+  const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
+    getByRole: () => absent,
+    getByText: () => ({ exactConnectorLabel: true }),
+    locator: (selector: string) => {
+      if (selector === "body") return {
+        press: async (_key: string, { signal }: { signal?: AbortSignal }) => {
+          expect(signal?.aborted).toBeFalse();
+          calls.push("escape");
+        },
+      };
+      expect(selector).toContain("__menu-item");
+      return menuRows;
+    },
+  };
+  const prototype = ChatGptBrowserWorker.prototype as unknown as {
+    selectConnector(page: unknown, capture?: unknown, refresh?: boolean, budget?: unknown, signal?: AbortSignal): Promise<unknown>;
+    clearChatGptComposerState(page: unknown): Promise<void>;
+  };
+
+  const selection = prototype.selectConnector.call({
+    config: { appName: "Codex Native2" },
+    activeComposer: async (_page: unknown, _timeout: number, signal?: AbortSignal) => {
+      expect(signal).toBeDefined();
+      return composer;
+    },
+    connectorIsSelected: async () => false,
+    clearChatGptComposerState: prototype.clearChatGptComposerState,
+  }, page, undefined, false, { triggerAttempts: 0 }, controller.signal);
+
+  await expect(selection).rejects.toMatchObject({ name: "AbortError" });
+  expect(calls).toEqual([
+    "probe-fill", "focus", "type", "proof-wait", "escape", "focus",
+    "cleanup-select-all", "cleanup-backspace", "cleanup-read",
+  ]);
+  expect(fillSignals).toHaveLength(1);
+  expect(fillSignals[0]?.aborted).toBeTrue();
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(calls).toEqual([
+    "probe-fill", "focus", "type", "proof-wait", "escape", "focus",
+    "cleanup-select-all", "cleanup-backspace", "cleanup-read",
+  ]);
+});
+
+test("a lost connector mention cannot be used as evidence to change personalization", async () => {
+  const absent = { filter: () => absent, count: async () => 0 };
+  const timeout = new Error("menu absent");
+  timeout.name = "TimeoutError";
+  const checkpoints: string[] = [];
+  let cleanupCalls = 0;
+  let stateReads = 0;
+  const composer = {
+    fill: async () => {}, focus: async () => {}, pressSequentially: async () => {},
+    evaluate: async () => ({ text: "", focused: false }),
+  };
+  const page = {
+    url: () => "https://chatgpt.com/?temporary-chat=true",
+    getByRole: () => absent,
+    getByText: () => ({}),
+    locator: (selector: string) => {
+      if (selector.includes("__menu-item")) return { filter: () => ({ waitFor: async () => { throw timeout; } }) };
+      stateReads += 1;
+      throw new Error("Personalization must not be inferred from a lost input");
+    },
+  };
+  const selectConnector = (ChatGptBrowserWorker.prototype as unknown as {
+    selectConnector(page: unknown, capture?: (checkpoint: string) => Promise<void>): Promise<unknown>;
+  }).selectConnector;
+  await expect(selectConnector.call({
+    config: { appName: CHATGPT_CONNECTOR_NAME },
+    activeComposer: async () => composer,
+    clearChatGptComposerState: async () => { cleanupCalls += 1; },
+  }, page, async checkpoint => { checkpoints.push(checkpoint); })).rejects.toMatchObject({
+    code: "prompt_attachment_integrity", retryable: false,
+  });
+  expect(cleanupCalls).toBe(1);
+  expect(stateReads).toBe(0);
+  expect(checkpoints).toContain("personalization-proof-menu-missing");
+  expect(checkpoints).not.toContain("personalization-unpersonalized");
 });
 
 test("an aborted real connector selection clears the typed mention before returning", async () => {

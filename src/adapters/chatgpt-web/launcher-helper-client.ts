@@ -257,6 +257,11 @@ export class LauncherBrowserHelperClient {
         "Launcher browser helper does not support the MCP completion fence; update or restart the launcher",
       );
     }
+    if (turn.preferClipboardPaste && !this.helperFeatures.has("clipboard-paste")) {
+      throw new Error(
+        "Launcher browser helper does not support native clipboard prompt paste; update or restart the launcher",
+      );
+    }
     const preparedBeforeHelper = turn.prepareBeforeHelper ? await turn.prepare() : undefined;
     if (turn.abortSignal?.aborted) {
       preparedBeforeHelper?.release();
@@ -372,6 +377,7 @@ export class LauncherBrowserHelperClient {
             ...(turn.captureLunaCheckpoint ? { captureLunaCheckpoint: true } : {}),
             ...(turn.externalProgress ? { externalProgress: true } : {}),
             ...(turn.allowCompletionWithoutAction ? { allowCompletionWithoutAction: true } : {}),
+            ...(turn.preferClipboardPaste ? { preferClipboardPaste: true } : {}),
           },
           ...(preparedRunFile ? { preparedFile: preparedRunFile } : preparedBeforeHelper ? {
             prepared: {

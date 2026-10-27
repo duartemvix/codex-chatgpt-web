@@ -44,6 +44,8 @@ test("raw browser response sends the exact input without Codex framing", async (
   expect(capturedProvider?.chatgptWeb?.useSavedChats).toBeFalse();
   expect(capturedTurn?.capabilities.localToolsEnabled).toBeFalse();
   expect(capturedTurn?.retainConversation).toBeFalse();
+  expect(capturedTurn?.preserveFailedTab).toBeFalse();
+  expect(capturedTurn?.preferClipboardPaste).toBeTrue();
   expect(capturedTurn?.prepareBeforeHelper).toBeTrue();
   expect(capturedTurn?.allowCompletionWithoutAction).toBeTrue();
   expect(capturedTurn?.modelId).toBe("gpt-5.6-sol");

@@ -3567,6 +3567,68 @@ test("failed ChatGPT pages remain inspectable but lose turn ownership and cannot
   assert.equal(fixture.turnTabs.size, 0);
 });
 
+test("one-shot failed browser turns can release their diagnostic tab immediately", async () => {
+  const { fixture, tab, closed } = failedAutomaticTurnFixture();
+  assert.deepEqual(
+    await fixture.endTurn(
+      tab.traceId,
+      tab.helperPid,
+      "failed",
+      false,
+      "Raw browser response failed before submission",
+      false,
+      false,
+      false,
+    ),
+    { cancelledByUser: false },
+  );
+  assert.equal(fixture.turnTabs.has(tab.id), false);
+  assert.deepEqual(closed, [tab.id]);
+});
+
+test("automatic browser prompt paste targets the owned tab and restores the user's clipboard", async () => {
+  const events = [];
+  let clipboardValue = "user clipboard";
+  const contents = {
+    isDestroyed: () => false,
+    focus: () => events.push("focus"),
+    sendInputEvent: event => events.push(["input", event.type, event.keyCode, event.modifiers, clipboardValue]),
+  };
+  const tab = {
+    id: "paste-tab",
+    traceId: "paste-trace",
+    helperPid: 1234,
+    interactionMode: "automatic",
+    status: "running",
+    view: { webContents: contents },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]),
+    clipboardPasteTail: Promise.resolve(),
+    clipboardPasteLeases: new Map(),
+    clipboard: {
+      readText: () => clipboardValue,
+      writeText: value => { clipboardValue = value; events.push(["clipboard", value]); },
+    },
+    logger: { info() {} },
+  });
+
+  const lease = await fixture.pasteTurnPrompt(tab.traceId, tab.helperPid, "score these companies");
+
+  assert.deepEqual(events, [
+    ["clipboard", "score these companies"],
+    "focus",
+    ["input", "keyDown", "V", [process.platform === "darwin" ? "meta" : "control"], "score these companies"],
+    ["input", "keyUp", "V", [process.platform === "darwin" ? "meta" : "control"], "score these companies"],
+  ]);
+  assert.equal(clipboardValue, "score these companies");
+  assert.equal(typeof lease.pasteId, "string");
+
+  assert.deepEqual(fixture.releaseTurnPromptPaste(tab.traceId, tab.helperPid, lease.pasteId), { restored: true });
+  assert.deepEqual(events.at(-1), ["clipboard", "user clipboard"]);
+  assert.equal(clipboardValue, "user clipboard");
+});
+
 test("failed pages cannot supply retained history and a same-trace retry gets a fresh document", async () => {
   const { fixture, tab, closed } = failedAutomaticTurnFixture();
   await fixture.endTurn(tab.traceId, tab.helperPid, "failed", false);

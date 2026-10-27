@@ -123,6 +123,8 @@ export async function browserResponsesRequest(
       // completed conversation for follow-up turns, but raw workflow calls must release their
       // Electron BrowserView as soon as the model response is complete.
       retainConversation: false,
+      preserveFailedTab: false,
+      preferClipboardPaste: true,
       // Raw workflow prompts can be much larger than normal helper-control frames. Prepare before
       // helper startup so LauncherBrowserHelperClient can move large payloads into its private,
       // digest-checked temporary-file handoff instead of sending them over helper stdin.

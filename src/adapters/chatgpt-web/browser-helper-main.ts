@@ -41,6 +41,7 @@ interface RunMessage {
     captureLunaCheckpoint?: boolean;
     externalProgress?: boolean;
     allowCompletionWithoutAction?: boolean;
+    preferClipboardPaste?: boolean;
   };
   prepared?: CompiledChatGptWebPrompt;
   preparedFile?: {
@@ -231,6 +232,10 @@ async function run(message: RunMessage): Promise<void> {
     && typeof message.turn.allowCompletionWithoutAction !== "boolean") {
     throw new Error("Browser helper completion-action override is invalid");
   }
+  if (message.turn.preferClipboardPaste !== undefined
+    && typeof message.turn.preferClipboardPaste !== "boolean") {
+    throw new Error("Browser helper clipboard-paste preference is invalid");
+  }
   if (initialPrepared !== undefined) {
     if (message.turn.resumeAvailable) {
       throw new Error("Browser helper prepared run prompt cannot be combined with continuation selection");
@@ -298,6 +303,7 @@ async function run(message: RunMessage): Promise<void> {
     abortSignal: abortController.signal,
     ...(message.turn.compaction ? { compaction: true } : {}),
     ...(message.turn.allowCompletionWithoutAction ? { allowCompletionWithoutAction: true } : {}),
+    ...(message.turn.preferClipboardPaste ? { preferClipboardPaste: true } : {}),
     ...(progress ? {
       externalProgress: progress,
       completionFence: {
@@ -619,4 +625,5 @@ writeProtocol({ type: "ready", features: [
   "prepared-run-prompt",
   "prepared-run-file",
   "run-accepted",
+  "clipboard-paste",
 ] });

@@ -475,7 +475,7 @@ test("one-shot prepared prompts require the helper to acknowledge the initial ru
   };
   const child = {};
   internal.child = child;
-  internal.helperFeatures = new Set(["prepared-run-prompt", "run-accepted"]);
+  internal.helperFeatures = new Set(["prepared-run-prompt", "run-accepted", "clipboard-paste"]);
   internal.ensureChild = async () => {};
   const sent: Record<string, any>[] = [];
   internal.send = async message => {
@@ -502,6 +502,7 @@ test("one-shot prepared prompts require the helper to acknowledge the initial ru
     reasoning: "high",
     capabilities: { localToolsEnabled: false, solAvailable: true, extraHighAvailable: false, proAvailable: false },
     prepareBeforeHelper: true,
+    preferClipboardPaste: true,
     prepare: async () => {
       prepareCalls += 1;
       return { text: "# Master prompt\n\nCompany input", images: [], release: () => { released = true; } };
@@ -515,6 +516,7 @@ test("one-shot prepared prompts require the helper to acknowledge the initial ru
   expect(sent[0]).toMatchObject({
     type: "run",
     id: "raw-prepared-123",
+    turn: { preferClipboardPaste: true },
     prepared: { text: "# Master prompt\n\nCompany input", images: [] },
   });
 });

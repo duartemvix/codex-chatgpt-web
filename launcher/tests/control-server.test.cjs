@@ -335,6 +335,7 @@ test("browser control server authenticates and owns turn visibility", async () =
         status: "completed",
         retain: true,
         connectorBound: true,
+        preserveFailedTab: false,
       }),
     });
     assert.equal(end.status, 200);
@@ -352,7 +353,7 @@ test("browser control server authenticates and owns turn visibility", async () =
         true,
       ],
       ["heartbeat", "abcdef123456", process.pid, true, undefined],
-      ["end", "abcdef123456", process.pid, "completed", true, undefined, true, true],
+      ["end", "abcdef123456", process.pid, "completed", true, undefined, true, true, false],
     ]);
     assert.equal(logs.some(([, event]) => event === "browser.turn_started"), true);
     assert.equal(logs.some(([, event]) => event === "browser.turn_ended"), true);
@@ -406,6 +407,45 @@ test("browser control server withholds a new turn lease until its browser surfac
     const response = await responsePromise;
     assert.equal(response.status, 200);
     assert.equal((await response.json()).tabId, "tab-ready");
+  } finally {
+    await server.close();
+  }
+});
+
+test("browser control server accepts a large owner-bound automatic clipboard paste", async () => {
+  const calls = [];
+  const host = {
+    browserInteractionMode: () => "automatic",
+    pasteTurnPrompt: async (...args) => { calls.push(["paste", ...args]); return { pasteId: "paste_abcdefghijklmnop" }; },
+    releaseTurnPromptPaste: (...args) => { calls.push(["release", ...args]); return { restored: true }; },
+  };
+  const server = await new BrowserControlServer({
+    logger: { info() {}, warn() {}, error() {} },
+    getBrowserHost: () => host,
+    getPreferences: () => ({}),
+  }).start();
+  const descriptor = server.descriptor();
+  const prompt = "x".repeat(128 * 1024);
+  try {
+    const response = await fetch(`${descriptor.endpoint}/v1/turn/paste`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${descriptor.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ traceId: "paste123456", helperPid: process.pid, prompt }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: true, pasteId: "paste_abcdefghijklmnop" });
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].slice(0, 3), ["paste", "paste123456", process.pid]);
+    assert.equal(calls[0][3], prompt);
+
+    const release = await fetch(`${descriptor.endpoint}/v1/turn/paste/release`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${descriptor.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ traceId: "paste123456", helperPid: process.pid, pasteId: "paste_abcdefghijklmnop" }),
+    });
+    assert.equal(release.status, 200);
+    assert.deepEqual(await release.json(), { ok: true, restored: true });
+    assert.deepEqual(calls[1], ["release", "paste123456", process.pid, "paste_abcdefghijklmnop"]);
   } finally {
     await server.close();
   }
