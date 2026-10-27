@@ -1136,6 +1136,7 @@ interface ChatGptSubmissionBaseline {
   submittedText?: string;
   turnToken?: string;
   acceptedUserIdentity?: string;
+  nativeClipboardPromptAccepted?: boolean;
   acknowledgedStages?: readonly ChatGptAcknowledgedMultipartStage[];
 }
 
@@ -3152,12 +3153,22 @@ export class ChatGptBrowserWorker {
         const locator = page.locator(chatGptAssistantTurnSelector(identity!));
         matches = baseline.acceptedUserIdentity
           ? user === baseline.acceptedUserIdentity
-          : Boolean(baseline.submittedText) && await this.userMessageMatchesSubmission(locator, baseline.submittedText!, signal, baseline.turnToken);
+          : baseline.nativeClipboardPromptAccepted && baseline.turnToken
+            // A large native Codex prompt can be represented by ChatGPT as a pasted-text
+            // attachment. Its user bubble no longer exposes the broker turn token or the full
+            // submitted text, so the ordinary rendered-message proof is unavailable after React
+            // replaces the temporary assistant group. The paste itself was already verified in
+            // the owned launcher tab before Send; at this point the strict one-new-user/assistant
+            // structural replacement above is the remaining ownership proof. Bind that user ID
+            // immediately so any later replacement must match the same accepted turn exactly.
+            ? true
+            : Boolean(baseline.submittedText) && await this.userMessageMatchesSubmission(locator, baseline.submittedText!, signal, baseline.turnToken);
         // The accepted user identity, broker token or exact text establishes ownership.
         // Activity can replace its temporary group while still generating; requiring
         // a completed answer here mistakes that same unfinished turn for a foreign one.
       }
       if (!matches) throw new Error("ChatGPT opened another user turn while the bound assistant response was detached");
+      if (!baseline.acceptedUserIdentity) baseline.acceptedUserIdentity = user;
       // Expanding a truncated bubble can yield to another DOM update. Keep the
       // no-competing-turn check valid after that action, not just before it.
       const current = await this.submissionDomState(page, baseline.domCache, signal);
@@ -5612,6 +5623,16 @@ export class ChatGptBrowserWorker {
         }
       }
       await diagnostics.capture(page, "prompt-attachment-complete");
+      if (turn.preferClipboardPaste
+        && finalPrompt.length >= CHATGPT_CLIPBOARD_PASTE_MIN_CHARS
+        && this.config.browserHost === "launcher"
+        && this.config.browserHostDescriptorPath) {
+        // `attachPrompt` only returns after the launcher paste has been accepted by ChatGPT and
+        // its clipboard lease has been acknowledged. Remember that proof for later response-DOM
+        // rebinding, where ChatGPT may expose only a generic pasted-text attachment in the user
+        // bubble instead of the original Codex turn token.
+        submissionBaseline.nativeClipboardPromptAccepted = true;
+      }
       await this.runStage(turn.traceId, "file_attachment", browserStageTimeouts.fileAttachment, (stageSignal) => (
         this.attachFiles(page, prepared, turn.abortSignal ? AbortSignal.any([stageSignal, turn.abortSignal]) : stageSignal)
       ));
