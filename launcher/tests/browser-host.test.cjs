@@ -3629,6 +3629,51 @@ test("automatic browser prompt paste targets the owned tab and restores the user
   assert.equal(clipboardValue, "user clipboard");
 });
 
+test("automatic browser prompt paste can use an ephemeral clipboard writer without touching Electron clipboard history", async () => {
+  const events = [];
+  let clipboardValue = "user clipboard";
+  const contents = {
+    isDestroyed: () => false,
+    focus: () => events.push("focus"),
+    sendInputEvent: event => events.push(["input", event.type, event.keyCode, event.modifiers, clipboardValue]),
+  };
+  const tab = {
+    id: "paste-tab-copyq",
+    traceId: "paste-trace-copyq",
+    helperPid: 1234,
+    interactionMode: "automatic",
+    status: "running",
+    view: { webContents: contents },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    turnTabs: new Map([[tab.id, tab]]),
+    clipboardPasteTail: Promise.resolve(),
+    clipboardPasteLeases: new Map(),
+    clipboard: {
+      readText: () => clipboardValue,
+      writeText: value => { throw new Error(`unexpected Electron clipboard write: ${value}`); },
+    },
+    ephemeralClipboardWriter: value => {
+      clipboardValue = value;
+      events.push(["ephemeral", value]);
+      return true;
+    },
+    logger: { info() {} },
+  });
+
+  const lease = await fixture.pasteTurnPrompt(tab.traceId, tab.helperPid, "score these companies");
+  assert.deepEqual(events, [
+    ["ephemeral", "score these companies"],
+    "focus",
+    ["input", "keyDown", "V", [process.platform === "darwin" ? "meta" : "control"], "score these companies"],
+    ["input", "keyUp", "V", [process.platform === "darwin" ? "meta" : "control"], "score these companies"],
+  ]);
+
+  assert.deepEqual(fixture.releaseTurnPromptPaste(tab.traceId, tab.helperPid, lease.pasteId), { restored: true });
+  assert.deepEqual(events.at(-1), ["ephemeral", "user clipboard"]);
+  assert.equal(clipboardValue, "user clipboard");
+});
+
 test("failed pages cannot supply retained history and a same-trace retry gets a fresh document", async () => {
   const { fixture, tab, closed } = failedAutomaticTurnFixture();
   await fixture.endTurn(tab.traceId, tab.helperPid, "failed", false);

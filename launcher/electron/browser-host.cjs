@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { createHash, randomBytes } = require("node:crypto");
+const { spawnSync } = require("node:child_process");
 const { clipboard, WebContentsView, powerMonitor, powerSaveBlocker, shell } = require("electron");
 const { writePrivateFileAtomic } = require("./atomic-file.cjs");
 const {
@@ -47,6 +48,78 @@ const TURN_HEARTBEAT_SWEEP_MS = 5_000;
 const TURN_HEARTBEAT_TIMEOUT_MS = 60_000;
 const TURN_TAB_BOOTSTRAP_TIMEOUT_MS = 120_000;
 const RETAINED_TURN_TAB_TTL_MS = 30 * 60 * 1000;
+const COPYQ_FLATPAK_ID = "com.github.hluk.copyq";
+const COPYQ_PROBE_TIMEOUT_MS = 2_000;
+const COPYQ_WRITE_TIMEOUT_MS = 5_000;
+const COPYQ_RETRY_AFTER_FAILURE_MS = 60_000;
+
+function commandSucceeded(executable, args, options = {}) {
+  const result = spawnSync(executable, args, {
+    stdio: ["ignore", "ignore", "ignore"],
+    timeout: COPYQ_PROBE_TIMEOUT_MS,
+    windowsHide: true,
+    ...options,
+  });
+  return !result.error && result.status === 0;
+}
+
+function resolveCopyQCommand() {
+  if (process.platform !== "linux") return null;
+  if (commandSucceeded("copyq", ["--version"])) {
+    return { executable: "copyq", prefix: [] };
+  }
+  if (commandSucceeded("flatpak", ["info", COPYQ_FLATPAK_ID])) {
+    return {
+      executable: "flatpak",
+      prefix: ["run", "--command=copyq", COPYQ_FLATPAK_ID],
+    };
+  }
+  return null;
+}
+
+function createCopyQClipboardWriter(logger) {
+  if (process.platform !== "linux") return null;
+  let command = null;
+  let nextProbeAt = 0;
+  let failureLogged = false;
+  return (text) => {
+    const now = Date.now();
+    if (!command) {
+      if (now < nextProbeAt) return false;
+      command = resolveCopyQCommand();
+      if (!command) {
+        nextProbeAt = now + COPYQ_RETRY_AFTER_FAILURE_MS;
+        return false;
+      }
+    }
+    const result = spawnSync(
+      command.executable,
+      [...command.prefix, "copy", "text/plain", "-"],
+      {
+        input: text,
+        encoding: "utf8",
+        stdio: ["pipe", "ignore", "pipe"],
+        timeout: COPYQ_WRITE_TIMEOUT_MS,
+        windowsHide: true,
+        maxBuffer: 1024 * 1024,
+      },
+    );
+    if (!result.error && result.status === 0) {
+      failureLogged = false;
+      return true;
+    }
+    if (!failureLogged) {
+      logger?.warn?.("browser.copyq_clipboard_write_failed", {
+        errorType: result.error?.name || "CopyQError",
+        errorCode: result.error?.code || result.status || "unknown",
+      });
+      failureLogged = true;
+    }
+    command = null;
+    nextProbeAt = now + COPYQ_RETRY_AFTER_FAILURE_MS;
+    return false;
+  };
+}
 
 function recordTurnActivity(tab, now = Date.now()) {
   const state = tab.approvalPending ? "approval"
@@ -360,6 +433,7 @@ class BrowserHost {
     this.publishState = publishState;
     this.showWindow = showWindow;
     this.clipboard = clipboardApi;
+    this.ephemeralClipboardWriter = createCopyQClipboardWriter(logger);
     this.clipboardPasteTail = Promise.resolve();
     this.clipboardPasteLeases = new Map();
     this.getBrowserInteractionMode = getBrowserInteractionMode;
@@ -2210,10 +2284,19 @@ class BrowserHost {
   }
 
   writeManualPrompt(prompt) {
+    this.writePromptClipboard(prompt);
+  }
+
+  writePromptClipboard(text) {
+    if (typeof this.ephemeralClipboardWriter === "function"
+      && this.ephemeralClipboardWriter(text)) {
+      return "copyq";
+    }
     if (!this.clipboard || typeof this.clipboard.writeText !== "function") {
       throw new Error("Electron clipboard is unavailable");
     }
-    this.clipboard.writeText(prompt);
+    this.clipboard.writeText(text);
+    return "electron";
   }
 
   async pasteTurnPrompt(traceId, helperPid, prompt) {
@@ -2233,12 +2316,10 @@ class BrowserHost {
         || (typeof contents.sendInputEvent !== "function" && typeof contents.paste !== "function")) {
         throw new Error("Electron browser tab cannot perform a native paste");
       }
-      if (!this.clipboard || typeof this.clipboard.writeText !== "function") {
+      if (!this.clipboard || typeof this.clipboard.readText !== "function") {
         throw new Error("Electron clipboard is unavailable");
       }
-      const previous = typeof this.clipboard.readText === "function"
-        ? this.clipboard.readText()
-        : undefined;
+      const previous = this.clipboard.readText();
       const pasteId = randomBytes(18).toString("base64url");
       const lease = {
         pasteId,
@@ -2249,7 +2330,7 @@ class BrowserHost {
         timeout: null,
       };
       try {
-        this.clipboard.writeText(prompt);
+        this.writePromptClipboard(prompt);
         contents.focus();
         if (typeof contents.sendInputEvent === "function") {
           const modifier = process.platform === "darwin" ? "meta" : "control";
@@ -2271,7 +2352,7 @@ class BrowserHost {
         }, 20_000);
         lease.timeout.unref?.();
       } catch (error) {
-        if (previous !== undefined) this.clipboard.writeText(previous);
+        if (previous !== undefined) this.writePromptClipboard(previous);
         releaseClipboardLease();
         throw error;
       }
@@ -2295,7 +2376,7 @@ class BrowserHost {
     this.clipboardPasteLeases.delete(pasteId);
     let restoreError;
     try {
-      if (lease.previous !== undefined) this.clipboard.writeText(lease.previous);
+      if (lease.previous !== undefined) this.writePromptClipboard(lease.previous);
     } catch (error) {
       restoreError = error;
     } finally {
@@ -3380,7 +3461,7 @@ class BrowserHost {
     for (const lease of this.clipboardPasteLeases.values()) {
       if (lease.timeout) clearTimeout(lease.timeout);
       try {
-        if (lease.previous !== undefined) this.clipboard.writeText(lease.previous);
+        if (lease.previous !== undefined) this.writePromptClipboard(lease.previous);
       } catch {}
       lease.release();
     }
