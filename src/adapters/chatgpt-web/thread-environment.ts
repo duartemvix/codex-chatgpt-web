@@ -263,9 +263,24 @@ export class ChatGptThreadEnvironmentStore {
           }
           if (resolvedCalendarDelta) {
             const nativeRoots = new Set(rolloutEnvironment.roots.map(pathIdentity));
+            const nativeGrants = new Set(
+              [...rolloutEnvironment.roots, ...rolloutEnvironment.writableRoots].map(pathIdentity),
+            );
+            const calendarRootsConflict = resolvedCalendarDelta.workspaceRoots.some(roots => {
+              const claimedRoots = new Set(roots.map(pathIdentity));
+              if (rollout.workspaceRootsDeclared) {
+                return claimedRoots.size !== nativeRoots.size
+                  || [...claimedRoots].some(root => !nativeRoots.has(root));
+              }
+              // Codex can omit workspace_roots from the turn_context while the environment
+              // delta still repeats output directories that are explicit native writable
+              // grants. In that shape, require every native workspace root to remain present
+              // and allow only extra roots already authenticated by the current rollout.
+              return [...nativeRoots].some(root => !claimedRoots.has(root))
+                || [...claimedRoots].some(root => !nativeGrants.has(root));
+            });
             if (resolvedCalendarDelta.filesystemProfiles.some(profile => profile !== rollout.filesystemProfileXml)
-              || resolvedCalendarDelta.workspaceRoots.some(roots => roots.length !== nativeRoots.size
-                || roots.some(root => !nativeRoots.has(root)))) {
+              || calendarRootsConflict) {
               throw new Error("Calendar environment delta conflicts with its current Codex rollout");
             }
           }

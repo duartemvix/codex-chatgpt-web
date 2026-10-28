@@ -1442,6 +1442,33 @@ describe("trusted Codex task environment continuity", () => {
     });
   }
 
+  test("fresh managed task accepts native output roots in a midnight delta when rollout workspace roots are omitted", () => {
+    const { codexHome, request, delta, rolloutPath } = managedMidnightFixture("workspace-write", false);
+    const output = resolve(root, "..", "native-midnight-output");
+    const records = readFileSync(rolloutPath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+    const context = records[1].payload;
+    const outputEntry = { path: { type: "path", path: output }, access: "write" };
+    delete context.workspace_roots;
+    context.sandbox_policy.writable_roots = [output];
+    context.permission_profile.file_system.entries.push(outputEntry);
+    context.file_system_sandbox_policy.entries.push(structuredClone(outputEntry));
+    writeFileSync(rolloutPath, records.map(value => JSON.stringify(value)).join("\n") + "\n");
+
+    const outputEntryXml = `<entry access="write"><path>${output}</path></entry>`;
+    delta.content[0]!.text = delta.content[0]!.text
+      .replace("<filesystem>",
+        `<filesystem><workspace_roots><root>${root}</root><root>${output}</root></workspace_roots>`)
+      .replace("</file_system>", `${outputEntryXml}</file_system>`);
+
+    const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
+    const actual = store.resolve(request);
+    expect(actual.roots).toEqual([root]);
+    expect(actual.writableRoots).toEqual([root, output]);
+
+    delta.content[0]!.text = delta.content[0]!.text.replaceAll(output, resolve(root, "..", "ungranted-midnight-root"));
+    expect(() => store.resolve(request)).toThrow("Calendar environment delta conflicts");
+  });
+
   test("managed midnight updates reject changed grants, protections and malformed profiles", () => {
     const { codexHome, request, delta } = managedMidnightFixture("workspace-write", false);
     const store = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome);
