@@ -213,7 +213,7 @@ test("real helper process loads large eager prompts through the private file han
     turnTimeoutMs: 60_000,
     headed: true,
     autoApproveToolCalls: false,
-    useSavedChats: false,
+    useTemporaryChats: true,
   });
   const prompt = `${marker}\n` + "[company]|Markdown \\\\ payload — café\n".repeat(4_000);
   let released = false;
@@ -464,7 +464,7 @@ test("one-shot prepared prompts require the helper to acknowledge the initial ru
     turnTimeoutMs: 60_000,
     headed: true,
     autoApproveToolCalls: false,
-    useSavedChats: false,
+    useTemporaryChats: true,
   });
   const internal = client as unknown as {
     child: unknown;
@@ -531,7 +531,7 @@ test("large one-shot prepared prompts use a private file-backed helper handoff",
     turnTimeoutMs: 60_000,
     headed: true,
     autoApproveToolCalls: false,
-    useSavedChats: false,
+    useTemporaryChats: true,
   });
   const internal = client as unknown as {
     child: unknown;
@@ -585,7 +585,7 @@ test("an unacknowledged prepared run fails fast as retryable instead of hanging"
     turnTimeoutMs: 60_000,
     headed: true,
     autoApproveToolCalls: false,
-    useSavedChats: false,
+    useTemporaryChats: true,
   };
   const client = new LauncherBrowserHelperClient(config, 20);
   const internal = client as unknown as {

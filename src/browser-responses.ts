@@ -98,7 +98,7 @@ export async function browserResponsesRequest(
     provider.chatgptWeb = {
       ...provider.chatgptWeb,
       localToolsEnabled: false,
-      useSavedChats: false,
+      useTemporaryChats: true,
     };
     const worker = workerFactory(provider);
     const traceId = `browser_${randomUUID().replaceAll("-", "")}`;

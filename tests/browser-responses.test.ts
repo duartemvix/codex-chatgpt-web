@@ -10,7 +10,7 @@ import type { CodexProviderConfig } from "../src/types";
 
 test("raw browser response sends the exact input without Codex framing", async () => {
   const config = defaultConfig("full");
-  config.useSavedChats = true;
+  config.useTemporaryChats = false;
   let capturedProvider: CodexProviderConfig | undefined;
   let capturedTurn: BrowserTurn | undefined;
 
@@ -41,7 +41,7 @@ test("raw browser response sends the exact input without Codex framing", async (
 
   expect(response.status).toBe(200);
   expect(capturedProvider?.chatgptWeb?.localToolsEnabled).toBeFalse();
-  expect(capturedProvider?.chatgptWeb?.useSavedChats).toBeFalse();
+  expect(capturedProvider?.chatgptWeb?.useTemporaryChats).toBeTrue();
   expect(capturedTurn?.capabilities.localToolsEnabled).toBeFalse();
   expect(capturedTurn?.retainConversation).toBeFalse();
   expect(capturedTurn?.preserveFailedTab).toBeFalse();
